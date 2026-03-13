@@ -1,0 +1,779 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>FortiGate Policy Viewer</title>
+
+<style>
+body {
+    font-family: Arial, sans-serif;
+    background: #f4f6f9;
+    margin: 40px;
+}
+
+h1 {
+    color: #333;
+}
+
+input {
+    margin-bottom: 20px;
+}
+
+button {
+    margin-left: 10px;
+    padding: 6px 10px;
+    border: 1px solid #c5ccd3;
+    border-radius: 4px;
+    background: white;
+    cursor: pointer;
+}
+
+button:disabled {
+    cursor: default;
+    opacity: 0.5;
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    background: white;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+}
+
+th {
+    background: #2c3e50;
+    color: white;
+    padding: 10px;
+    text-align: left;
+}
+
+td {
+    padding: 8px;
+    border-bottom: 1px solid #ddd;
+}
+
+tr:hover {
+    background-color: #f1f1f1;
+}
+
+.badge-accept {
+    color: white;
+    background: #27ae60;
+    padding: 4px 8px;
+    border-radius: 4px;
+}
+
+.badge-deny {
+    color: white;
+    background: #c0392b;
+    padding: 4px 8px;
+    border-radius: 4px;
+}
+
+.object-badge {
+    display: inline-block;
+    background: #ecf0f1;
+    padding: 4px 8px;
+    margin: 2px;
+    border-radius: 4px;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.object-badge:hover {
+    background: #d0d7de;
+}
+
+.object-badge.active-filter {
+    background: #2c3e50;
+    color: white;
+}
+
+#filterStatus {
+    margin: 10px 0 12px;
+    color: #2c3e50;
+    font-size: 14px;
+}
+
+#note {
+    background: #fff3cd;
+    border: 1px solid #ffeeba;
+    padding: 15px;
+    margin-bottom: 20px;
+    border-radius: 4px;
+    text-shadow: #27ae60;
+}
+
+</style>
+</head>
+
+<body>
+
+<h1>FortiGate Policy Viewer</h1>
+<div id="note">
+Note: This is a basic viewer and may not cover all FortiGate configuration nuances. It is intended for quick analysis and should not replace comprehensive configuration reviews.</br>
+You can hover over any badge to see its details. But it covers only VIP and Service and does not show some nested objects </br>
+Use can use filters by clicking on the "From" or "To" objects. probably shadowed rules are highlighted in red.</br>
+</div>
+
+
+<input type="file" id="fileInput">
+<button type="button" id="resetFilters" disabled>Reset Filters</button>
+<div id="filterStatus"></div>
+
+<table id="policyTable">
+    <thead>
+        <tr>
+            <th>Policy</th>
+            <th>From</th>
+            <th>To</th>
+            <th>Source</th>
+            <th>Destination</th>
+            <th>Schedule</th>
+            <th>Service</th>
+            <th>Action</th>
+            <th>NAT</th>
+            <th>Security Profiles</th>
+            <th>Log</th>
+        </tr>
+    </thead>
+    <tbody></tbody>
+</table>
+
+<script>
+
+let parsedData = null;
+let activeFilters = { from: null, to: null };
+
+document.getElementById("fileInput").addEventListener("change", function(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = function(e) {
+        const content = e.target.result;
+        parsedData = parseFortiConfig(content);
+        detectShadowedRules(parsedData.policies);
+        activeFilters = { from: null, to: null };
+        updateFilterStatus();
+        renderTable(parsedData);
+    };
+    reader.readAsText(file);
+});
+
+document.querySelector("#policyTable tbody").addEventListener("click", function(event) {
+    const badge = event.target.closest(".object-badge[data-filter-type]");
+    if (!badge || !parsedData) return;
+
+    const filterType = badge.dataset.filterType;
+    const filterValue = badge.dataset.filterValue;
+
+    if (!["from", "to"].includes(filterType)) return;
+
+    activeFilters[filterType] = activeFilters[filterType] === filterValue ? null : filterValue;
+    updateFilterStatus();
+    renderTable(parsedData);
+});
+
+document.getElementById("resetFilters").addEventListener("click", function() {
+    if (!parsedData) return;
+    activeFilters = { from: null, to: null };
+    updateFilterStatus();
+    renderTable(parsedData);
+});
+
+
+/* =========================
+   PARSER CORE
+========================= */
+
+function extractValues(line) {
+    const quoted = [...line.matchAll(/"([^"]+)"/g)].map(m => m[1]);
+    if (quoted.length > 0) return quoted;
+    return line.split(/\s+/).slice(2);
+}
+
+function extractEditName(line) {
+    const quotedMatch = line.match(/"([^"]+)"/);
+    if (quotedMatch) return quotedMatch[1];
+
+    const parts = line.split(/\s+/);
+    return parts.length > 1 ? parts.slice(1).join(" ") : null;
+}
+
+function maskToCidr(mask) {
+    return mask.split('.')
+        .map(o => parseInt(o).toString(2))
+        .join('')
+        .split('1').length - 1;
+}
+
+function countryCodeToFlag(code) {
+    if (!code || code.length !== 2) return "";
+    return code
+        .toUpperCase()
+        .split("")
+        .map(char => String.fromCodePoint(127397 + char.charCodeAt(0)))
+        .join("");
+}
+
+function addSecurityProfile(policy, type, name) {
+    if (!policy || !type || !name) return;
+    const exists = policy.securityProfiles.some(p => p.type === type && p.name === name);
+    if (!exists) {
+        policy.securityProfiles.push({ type, name });
+    }
+}
+
+function parseFortiConfig(configText) {
+
+    const lines = configText.split("\n");
+
+    let vipMap = {};
+    let policies = [];
+    let addressMap = {};
+    let addressGeoMap = {};
+    let addressGroups = {};
+    let serviceMap = {};
+    let interfaceMap = {};
+
+    let insidePolicy = false;
+    let insideAddress = false;
+    let insideAddrGrp = false;
+    let insideService = false;
+    let insideVIP = false;
+    let insideInterface = false;
+    
+    let currentPolicy = null;
+    let currentAddress = null;
+    let currentGroup = null;
+    let currentService = null;
+    let currentVIP = null;
+    let currentInterface = null;
+
+    for (let raw of lines) {
+
+        let line = raw.trim();
+
+        /* -------- POLICY -------- */
+
+        if (line.startsWith("config firewall policy")) {
+            insidePolicy = true;
+            continue;
+        }
+        if (insidePolicy && line === "end") {
+            insidePolicy = false;
+            continue;
+        }
+
+        if (insidePolicy) {
+
+            if (line.startsWith("edit")) {
+                currentPolicy = {
+                    policy: extractEditName(line) || "",
+                    from: [],
+                    to: [],
+                    source: [],
+                    destination: [],
+                    schedule: [],
+                    service: [],
+                    action: "",
+                    nat: "",
+                    securityProfiles: [],
+                    log: "",
+                    shadowed: false
+                };
+            }
+
+            if (line.startsWith("set") && currentPolicy) {
+                const key = line.split(/\s+/)[1];
+                const values = extractValues(line);
+
+                switch(key) {
+                    case "srcintf": currentPolicy.from = values; break;
+                    case "dstintf": currentPolicy.to = values; break;
+                    case "srcaddr": currentPolicy.source = values; break;
+                    case "dstaddr": currentPolicy.destination = values; break;
+                    case "schedule": currentPolicy.schedule = values; break;
+                    case "service": currentPolicy.service = values; break;
+                    case "action": currentPolicy.action = values[0] || ""; break;
+                    case "nat": currentPolicy.nat = values[0] || ""; break;
+                    case "logtraffic":
+                    case "logtraffic-start":
+                        currentPolicy.log = values[0] || "";
+                        break;
+                    case "ssl-ssh-profile":
+                    case "application-list":
+                    case "av-profile":
+                    case "ips-sensor":
+                    case "webfilter-profile":
+                    case "dnsfilter-profile":
+                    case "spamfilter-profile":
+                    case "dlp-sensor":
+                    case "waf-profile":
+                    case "file-filter-profile":
+                    case "icap-profile":
+                    case "profile-protocol-options":
+                    case "voip-profile":
+                    case "videofilter-profile":
+                    case "casb-profile":
+                    case "profile-group":
+                        addSecurityProfile(currentPolicy, key, values[0] || "");
+                        break;
+                    default:
+                        if (key.endsWith("-profile") || key.endsWith("-sensor")) {
+                            addSecurityProfile(currentPolicy, key, values[0] || "");
+                        }
+                        break;
+                }
+            }
+
+            if (line === "next" && currentPolicy) {
+                policies.push(currentPolicy);
+                currentPolicy = null;
+            }
+        }
+
+        /* -------- ADDRESS -------- */
+
+        if (line.startsWith("config firewall address")) {
+            insideAddress = true;
+            continue;
+        }
+        if (insideAddress && line === "end") {
+            insideAddress = false;
+            continue;
+        }
+
+        if (insideAddress) {
+
+            if (line.startsWith("edit")) {
+                currentAddress = extractEditName(line);
+            }
+
+            if (line.startsWith("set type") && currentAddress) {
+                const values = extractValues(line);
+                if (values[0] === "geography" && !addressGeoMap[currentAddress]) {
+                    addressGeoMap[currentAddress] = { country: "", flag: "" };
+                }
+            }
+
+            if (line.startsWith("set country") && currentAddress) {
+                const values = extractValues(line);
+                const country = (values[0] || "").toUpperCase();
+                if (!addressGeoMap[currentAddress]) {
+                    addressGeoMap[currentAddress] = { country: "", flag: "" };
+                }
+                addressGeoMap[currentAddress].country = country;
+                addressGeoMap[currentAddress].flag = countryCodeToFlag(country);
+            }
+
+            if (line.startsWith("set subnet") && currentAddress) {
+                const parts = line.split(/\s+/);
+                const ip = parts[2];
+                const mask = parts[3];
+                const cidr = maskToCidr(mask);
+                addressMap[currentAddress] = ip + "/" + cidr;
+            }
+
+            if (line === "next") {
+                currentAddress = null;
+            }
+        }
+
+        /* -------- INTERFACES -------- */
+
+        if (line.startsWith("config system interface")) {
+            insideInterface = true;
+            continue;
+        }
+        if (insideInterface && line === "end") {
+            insideInterface = false;
+            continue;
+        }
+
+        if (insideInterface) {
+
+            if (line.startsWith("edit")) {
+                currentInterface = extractEditName(line);
+                if (currentInterface) {
+                    interfaceMap[currentInterface] = { ip: "", vlanId: "", parent: "" };
+                }
+            }
+
+            if (line.startsWith("set ip") && currentInterface) {
+                const parts = line.split(/\s+/);
+                const ip = parts[2];
+                const mask = parts[3];
+                if (ip && mask) {
+                    interfaceMap[currentInterface].ip = `${ip}/${maskToCidr(mask)}`;
+                } else if (ip) {
+                    interfaceMap[currentInterface].ip = ip;
+                }
+            }
+
+            if (line.startsWith("set vlanid") && currentInterface) {
+                interfaceMap[currentInterface].vlanId = extractValues(line)[0] || "";
+            }
+
+            if (line.startsWith("set interface") && currentInterface) {
+                interfaceMap[currentInterface].parent = extractValues(line)[0] || "";
+            }
+
+            if (line === "next") {
+                currentInterface = null;
+            }
+        }
+
+        /* -------- ADDRESS GROUP -------- */
+
+        if (line.startsWith("config firewall addrgrp")) {
+            insideAddrGrp = true;
+            continue;
+        }
+        if (insideAddrGrp && line === "end") {
+            insideAddrGrp = false;
+            continue;
+        }
+
+        if (insideAddrGrp) {
+
+            if (line.startsWith("edit")) {
+                currentGroup = extractEditName(line);
+                if (currentGroup) {
+                    addressGroups[currentGroup] = [];
+                }
+            }
+
+            if (line.startsWith("set member") && currentGroup) {
+                addressGroups[currentGroup] = extractValues(line);
+            }
+
+            if (line === "next") {
+                currentGroup = null;
+            }
+        }
+
+        /* -------- VIP OBJECTS -------- */
+
+
+if (line.startsWith("config firewall vip")) {
+    insideVIP = true;
+    continue;
+}
+
+if (insideVIP && line === "end") {
+    insideVIP = false;
+    continue;
+}
+
+if (insideVIP) {
+
+    if (line.startsWith("edit")) {
+
+        currentVIP = extractEditName(line);
+
+        if (currentVIP) {
+            vipMap[currentVIP] = {
+                extip: "",
+                mappedip: "",
+                extintf: "",
+                comment: ""
+            };
+        }
+    }
+
+    if (line.startsWith("set extip") && currentVIP) {
+        vipMap[currentVIP].extip = extractValues(line)[0];
+    }
+
+    if (line.startsWith("set mappedip") && currentVIP) {
+        vipMap[currentVIP].mappedip = extractValues(line)[0];
+    }
+
+    if (line.startsWith("set extintf") && currentVIP) {
+        vipMap[currentVIP].extintf = extractValues(line)[0];
+    }
+
+    if (line.startsWith("set comment") && currentVIP) {
+        vipMap[currentVIP].comment = extractValues(line).join(" ");
+    }
+
+    if (line === "next") {
+        currentVIP = null;
+    }
+}
+
+        /* -------- SERVICE CUSTOM -------- */
+
+        if (line.startsWith("config firewall service custom")) {
+            insideService = true;
+            continue;
+        }
+        if (insideService && line === "end") {
+            insideService = false;
+            continue;
+        }
+
+        if (insideService) {
+
+            if (line.startsWith("edit")) {
+                currentService = extractEditName(line);
+                if (currentService) {
+                    serviceMap[currentService] = { tcp: [], udp: [] };
+                }
+            }
+
+            if (line.startsWith("set tcp-portrange") && currentService) {
+                serviceMap[currentService].tcp = extractValues(line);
+            }
+
+            if (line.startsWith("set udp-portrange") && currentService) {
+                serviceMap[currentService].udp = extractValues(line);
+            }
+
+            if (line === "next") {
+                currentService = null;
+            }
+        }
+    }
+
+    return { policies, addressMap, addressGeoMap, addressGroups, serviceMap, vipMap, interfaceMap };
+}
+
+
+/* =========================
+   GROUP RESOLUTION
+========================= */
+
+function resolveAddress(name, maps, depth = 0) {
+
+    if (depth > 5) return name; // prevent infinite recursion
+
+    const { addressMap, addressGeoMap, addressGroups } = maps;
+
+    if (addressMap[name]) {
+        return name + " -> " + addressMap[name];
+    }
+
+    if (addressGeoMap[name]) {
+        const geo = addressGeoMap[name];
+        const countryText = geo.country ? geo.country : "Unknown";
+        const flagText = geo.flag ? " " + geo.flag : "";
+        return `${name} -> Geography: ${countryText}${flagText}`;
+    }
+
+    if (addressGroups[name]) {
+        return addressGroups[name]
+            .map(member => resolveAddress(member, maps, depth + 1))
+            .join("\n");
+    }
+
+    return name;
+}
+
+function resolveService(name, serviceMap) {
+
+    if (!serviceMap[name]) return name;
+
+    const svc = serviceMap[name];
+
+    let result = name + " → ";
+
+    if (svc.tcp.length)
+        result += "TCP: " + svc.tcp.join(", ") + " ";
+
+    if (svc.udp.length)
+        result += "UDP: " + svc.udp.join(", ");
+
+    return result;
+}
+
+function resolveInterface(name, interfaceMap) {
+
+    if (!interfaceMap[name]) return name;
+
+    const intf = interfaceMap[name];
+    let result = name;
+
+    if (intf.ip) result += `\nIP: ${intf.ip}`;
+    if (intf.vlanId) result += `\nVLAN ID: ${intf.vlanId}`;
+    if (intf.parent) result += `\nParent: ${intf.parent}`;
+
+    return result;
+}
+
+function resolveVIP(name, vipMap) {
+
+    if (!vipMap[name]) return null;
+
+    const vip = vipMap[name];
+
+    return `${name}
+External IP: ${vip.extip}
+Mapped IP: ${vip.mappedip}
+Interface: ${vip.extintf}
+Comment: ${vip.comment}`;
+}
+
+/* =========================
+   SHADOW DETECTION (basic)
+========================= */
+
+function detectShadowedRules(policies) {
+
+    for (let i = 0; i < policies.length; i++) {
+        for (let j = 0; j < i; j++) {
+
+            const prev = policies[j];
+            const curr = policies[i];
+
+            if (
+                prev.action === "accept" &&
+                JSON.stringify(prev.from) === JSON.stringify(curr.from) &&
+                JSON.stringify(prev.to) === JSON.stringify(curr.to) &&
+                prev.source.includes("all") &&
+                prev.destination.includes("all")
+            ) {
+                curr.shadowed = true;
+            }
+        }
+    }
+}
+
+
+/* =========================
+   FILTERING
+========================= */
+
+function policyMatchesFilters(policy) {
+
+    if (activeFilters.from && !policy.from.includes(activeFilters.from))
+        return false;
+
+    if (activeFilters.to && !policy.to.includes(activeFilters.to))
+        return false;
+
+    return true;
+}
+
+function updateFilterStatus() {
+
+    const status = document.getElementById("filterStatus");
+    const resetButton = document.getElementById("resetFilters");
+    const hasFilter = !!(activeFilters.from || activeFilters.to);
+
+    resetButton.disabled = !hasFilter;
+
+    if (!hasFilter) {
+        status.textContent = "";
+        return;
+    }
+
+    const parts = [];
+    if (activeFilters.from) parts.push(`From: ${activeFilters.from}`);
+    if (activeFilters.to) parts.push(`To: ${activeFilters.to}`);
+    status.textContent = `Filtered by ${parts.join(" | ")}`;
+}
+
+/* =========================
+   RENDER
+========================= */
+
+function createBadges(items, maps, type, filterType = null) {
+
+    if (!items || items.length === 0) return "";
+
+    return items.map(item => {
+
+        let tooltip = item;
+        let label = item;
+
+        const vipTooltip = resolveVIP(item, maps.vipMap);
+
+        if (vipTooltip)
+            tooltip = vipTooltip;
+
+        else if (type === "address")
+            tooltip = resolveAddress(item, maps);
+
+        else if (type === "service")
+            tooltip = resolveService(item, maps.serviceMap);
+
+        else if (type === "interface")
+            tooltip = resolveInterface(item, maps.interfaceMap);
+
+        if (type === "address" && maps.addressGeoMap[item]) {
+            const geo = maps.addressGeoMap[item];
+            const extra = [geo.country, geo.flag].filter(Boolean).join(" ");
+            if (extra) label = `${item} (${extra})`;
+        }
+
+        const isFilterBadge = filterType === "from" || filterType === "to";
+        const isActive = isFilterBadge && activeFilters[filterType] === item;
+        const className = `object-badge${isActive ? " active-filter" : ""}`;
+        const filterAttrs = isFilterBadge
+            ? ` data-filter-type="${filterType}" data-filter-value="${item}"`
+            : "";
+
+        return `<span class="${className}" title="${tooltip}"${filterAttrs}>${label}</span>`;
+    }).join(" ");
+}
+
+function createSecurityProfileBadges(profiles) {
+    if (!profiles || profiles.length === 0) return "";
+
+    return profiles
+        .map(profile => `<span class="object-badge" title="${profile.type}">${profile.type}: ${profile.name}</span>`)
+        .join(" ");
+}
+
+function renderTable(data) {
+
+    const { policies } = data;
+    const tbody = document.querySelector("#policyTable tbody");
+    tbody.innerHTML = "";
+
+    const visiblePolicies = policies.filter(policyMatchesFilters);
+
+    if (visiblePolicies.length === 0) {
+        const emptyRow = document.createElement("tr");
+        emptyRow.innerHTML = `<td colspan="11">No policies match the selected filter.</td>`;
+        tbody.appendChild(emptyRow);
+        return;
+    }
+
+    visiblePolicies.forEach(p => {
+
+        const row = document.createElement("tr");
+
+        if (p.shadowed)
+            row.style.backgroundColor = "#ffe6e6";
+
+        row.innerHTML = `
+            <td>${p.policy}</td>
+            <td>${createBadges(p.from, data, "interface", "from")}</td>
+            <td>${createBadges(p.to, data, "interface", "to")}</td>
+            <td>${createBadges(p.source, data, "address")}</td>
+            <td>${createBadges(p.destination, data, "address")}</td>
+            <td>${createBadges(p.schedule, data, "plain")}</td>
+            <td>${createBadges(p.service, data, "service")}</td>
+            <td>
+                <span class="${p.action === 'accept' ? 'badge-accept' : 'badge-deny'}">
+                    ${p.action}
+                </span>
+            </td>
+            <td>${p.nat ? `<span class="object-badge">${p.nat}</span>` : ""}</td>
+            <td>${createSecurityProfileBadges(p.securityProfiles)}</td>
+            <td>${p.log ? `<span class="object-badge">${p.log}</span>` : ""}</td>
+        `;
+
+        tbody.appendChild(row);
+    });
+}
+
+</script>
+
+</body>
+</html>
+
