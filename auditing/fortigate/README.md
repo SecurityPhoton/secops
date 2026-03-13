@@ -1,5 +1,7 @@
 # FortiGate Policy Viewer
 
+![A screenshot of the page](sample-view.png)
+
 This project is a lightweight browser-based viewer for FortiGate configuration files. It focuses on turning `config firewall policy` sections into a readable table and enriching those rules with details parsed from related objects such as addresses, address groups, VIPs, services, interfaces, and security profiles.
 
 The viewer is implemented as a single static HTML file: `fortigate-viewer.html`. There is no build step, backend, or dependency installation required.
